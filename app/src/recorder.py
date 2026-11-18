@@ -119,9 +119,17 @@ class JobRunner:
             log.info("job %s window starts at seq %s", self.job_id, pl.media_sequence)
         else:
             if pl.media_sequence > fresh["last_seq"] + 1:
-                missing = list(range(fresh["last_seq"] + 1, pl.media_sequence))
-                self.db.insert_missing(self.job_id, missing)
-                raise SourceError(f"窗口越过未发现的序号: {missing}")
+                # The window jumped over undiscovered numbers (typical when a
+                # flaky source reconnects much later). Persist the gap as a
+                # closed interval first — small spans as per-sequence rows,
+                # large spans as a single range row so even a jump of
+                # hundreds of thousands is O(1) and cannot stall the DB —
+                # then fail the job right away.
+                start = fresh["last_seq"] + 1
+                end = pl.media_sequence - 1
+                self.db.record_missing_span(self.job_id, start, end)
+                raise SourceError(
+                    f"窗口越过未发现的序号: [{start}, {end}] 共 {end - start + 1} 段")
             if last > fresh["last_seq"]:
                 self.db.update_last_seq(self.job_id, last)
 

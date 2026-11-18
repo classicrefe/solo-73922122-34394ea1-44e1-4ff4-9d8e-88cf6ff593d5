@@ -33,7 +33,8 @@
     本机直播源示例：<code>http://livesource:8080/live.m3u8</code>（普通）、
     <code>http://livesource:8080/live.m3u8?delay_ms=1500</code>（慢下载）、
     <code>http://livesource:8080/live.m3u8?missing=12</code>（缺段）、
-    <code>http://livesource:8080/live.m3u8?jump_at=10&amp;jump_by=8</code>（窗口跳号）。
+    <code>http://livesource:8080/live.m3u8?jump_at=10&amp;jump_by=8</code>（窗口跳号）、
+    <code>http://livesource:8080/live.m3u8?jump_at=10&amp;jump_by=400000</code>（大跨度跳号，模拟断线恢复）。
   </p>
 </div>
 
@@ -57,7 +58,15 @@ async function refresh() {
       const tr = document.createElement('tr');
       const win = (j.first_seq === null) ? '—'
         : `${j.first_seq} .. ${j.last_seq}` + (j.stop_seq !== null ? `（止于 ${j.stop_seq}）` : '');
-      const miss = (j.missing && j.missing.length) ? `<span class="err">缺段: ${j.missing.join(', ')}</span><br>` : '';
+      const miss = (() => {
+        if (!j.missing_count) return '';
+        const parts = [];
+        if (j.missing && j.missing.length) parts.push(`缺段: ${j.missing.join(', ')}`);
+        if (j.missing_ranges && j.missing_ranges.length)
+          parts.push(`缺段区间(闭区间): ${j.missing_ranges.map(r => `[${r[0]}, ${r[1]}]`).join(', ')}`);
+        parts.push(`共缺 ${j.missing_count} 段`);
+        return `<span class="err">${parts.join('；')}</span><br>`;
+      })();
       const err = j.error ? `<span class="err">${j.error}</span>` : '';
       let ops = '';
       if (j.state === 'recording') ops += `<button onclick="stopJob(${j.id})">停止</button> `;

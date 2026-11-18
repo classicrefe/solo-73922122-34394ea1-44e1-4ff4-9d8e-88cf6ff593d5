@@ -194,6 +194,9 @@ try:
     check("D 窗口越过未发现序号须失败", j["state"] == "failed" and "越过" in (j["error"] or ""),
           str(j))
     check("D 缺段被列出", len(j["missing"] or []) > 0, str(j["missing"]))
+    check("D 小跨度逐号缺段(原接口)且无区间记录",
+          not j["missing_ranges"] and j["missing_count"] == len(j["missing"]),
+          f"ranges={j['missing_ranges']} count={j['missing_count']} list={j['missing']}")
 
     # ---------- H: invalid playlists rejected ----------
     for path, kw in [("master.m3u8", "单层"), ("enc.m3u8", "加密"), ("disc.m3u8", "不连续")]:
@@ -266,6 +269,57 @@ try:
     j = wait_job(jid, {"done"}, 60)
     ok, detail = verify_zip(jid, j["first_seq"], j["stop_seq"])
     check("G 收养的片段进入最终包", ok, detail)
+
+    # ---------- L: huge window jump (source reconnect) -> compact range ----------
+    # Reproduces the incident: playlist jumps e.g. 100..104 -> 400105. The job
+    # must fail promptly, persist the gap as a closed interval (not 400k
+    # rows), keep counts accurate, and never block the other recording.
+    other = start_job(f"{SRC}/live.m3u8")       # concurrent recording, must stay alive
+    time.sleep(2)
+    ja = now_seq() + 3
+    jid = start_job(f"{SRC}/live.m3u8?jump_at={ja}&jump_by=400000")
+    t0 = time.time()
+    j = wait_job(jid, {"failed"}, 30)
+    dt = time.time() - t0
+    check("L 大跨度跳号及时判失败", j["state"] == "failed" and dt < 25,
+          f"{dt:.1f}s state={j['state']}")
+    ranges = j["missing_ranges"] or []
+    span_len = ranges[0][1] - ranges[0][0] + 1 if len(ranges) == 1 else -1
+    check("L 缺段闭区间与数量准确",
+          len(ranges) == 1 and span_len == j["missing_count"]
+          and 399000 <= j["missing_count"] <= 401000 and "越过" in (j["error"] or ""),
+          f"ranges={ranges} count={j['missing_count']} err={j['error']}")
+    check("L 大跨度不返回巨型缺段列表", len(j["missing"] or []) <= 1000,
+          f"missing list len={len(j['missing'] or [])}")
+    conn = sqlite3.connect(f"{DATA}/recorder.db")
+    nrows = conn.execute("SELECT COUNT(*) FROM segments WHERE job_id=?", (jid,)).fetchone()[0]
+    ndone = conn.execute(
+        "SELECT COUNT(*) FROM segments WHERE job_id=? AND status='done'", (jid,)).fetchone()[0]
+    conn.close()
+    check("L 大跨度不逐号占用数据库", nrows <= 1000, f"segment rows={nrows}")
+    check("L 应收/已存/缺段计数准确",
+          j["expected"] == nrows + j["missing_count"] and j["saved"] == ndone,
+          f"expected={j['expected']} rows={nrows} saved={j['saved']}/{ndone} miss={j['missing_count']}")
+    r = api("get", "/")
+    check("L 网页直接展示缺段区间", r.status_code == 200 and "missing_ranges" in r.text)
+    o1 = get_job(other)["saved"]
+    time.sleep(3)
+    t0 = time.time(); o2 = get_job(other)["saved"]; dt_q = time.time() - t0
+    check("L 跳号处理期间其他录制继续", o2 > o1, f"saved {o1}->{o2}")
+    check("L 查询保持响应(<2s)", dt_q < 2.0, f"{dt_q:.2f}s")
+    saved_before = j["saved"]
+    kill_app()
+    start_app()
+    j = get_job(jid)
+    check("L 重启后失败任务保留缺段信息",
+          j["state"] == "failed" and j["missing_ranges"] == ranges
+          and j["missing_count"] == span_len and j["saved"] == saved_before,
+          f"ranges={j['missing_ranges']} count={j['missing_count']} saved={j['saved']}")
+    r = api("get", f"/api/jobs/{jid}/download")
+    check("L 失败任务禁止下载ZIP", r.status_code == 409, f"got {r.status_code}")
+    stop_job(other)
+    jo = wait_job(other, {"done"}, 60)
+    check("L 并发录制正常完成", jo["state"] == "done", jo["state"])
 
 finally:
     kill_app()

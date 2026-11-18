@@ -21,6 +21,7 @@ docker compose up --build
 | 慢下载（每段延迟 1.5s） | `http://livesource:8080/live.m3u8?delay_ms=1500` |
 | 缺段（指定序号返回 404） | `http://livesource:8080/live.m3u8?missing=12,13` |
 | 窗口跳号（越过未发现序号） | `http://livesource:8080/live.m3u8?jump_at=10&jump_by=8` |
+| 大跨度跳号（模拟断线恢复，如 100→400105） | `http://livesource:8080/live.m3u8?jump_at=10&jump_by=400000` |
 | VOD（带 ENDLIST） | `http://livesource:8080/vod.m3u8` |
 | 非法样例（master/加密/不连续） | `/master.m3u8` `/enc.m3u8` `/disc.m3u8` |
 
@@ -30,13 +31,19 @@ docker compose up --build
   `EXT-X-KEY`）、无不连续标记、MPEG-TS（片段须为 `.ts`，拒绝 `EXT-X-MAP`），
   片段地址在清单内与整个录制任务内均不得复用。
 - **追随滑窗**：从首份清单首段（其 `EXT-X-MEDIA-SEQUENCE`）开始，按媒体序号
-  判定连续性；新清单起点越过 `last_seq+1` 即判失败并列出缺段序号。
+  判定连续性；新清单起点越过 `last_seq+1` 即判失败。缺段按跨度分别持久化：
+  小跨度（≤1000 个序号）逐号记录，可按原接口查看逐号缺段；大跨度只写一条
+  闭区间 `[start, end]` 记录并统计数量——40 万级跳号也是 O(1) 落库，不会
+  逐号占用数据库、不会返回巨型列表，其他录制、停止与查询不被卡住。接口与
+  网页同时给出逐号缺段（小跨度）、缺段闭区间与缺段总数，应收/已存/缺段
+  计数均把大跨度区间计入。
 - **停止**：受理时把边界固定为最后已接收清单的尾段并立即持久化，此后不再
   延长范围（拉取途中的清单若晚于停止到达会被丢弃）；重启后边界不变。
 - **完成**：边界内全部片段保存后才生成并开放 ZIP；ZIP 内含本地
   `playlist.m3u8`（`EXT-X-ENDLIST`，仅引用包内文件）与原始片段。
 - **失败**：应收片段 404、窗口跳号、源违反约束、持续拉取/下载失败均判失败，
-  失败任务列出缺段且不提供下载，不会跳过后报成功。
+  失败任务列出缺段（逐号和/或闭区间）且不提供下载，不会跳过后报成功；
+  缺段信息持久化在 SQLite，重启后保留，失败任务始终禁止下载 ZIP。
 - **持久化**：片段与 ZIP 存持久卷（`/data`，compose 命名卷），SQLite 只存
   进度（任务状态、边界、每段状态）。落盘用临时文件 + 原子 rename；
   重启时对账磁盘与 DB——已落盘未登记的片段收养为完成，登记完成但文件丢失
@@ -50,6 +57,10 @@ docker compose up --build
 - `POST /api/jobs/{id}/stop` 停止（固定边界）
 - `GET /api/jobs` / `GET /api/jobs/{id}` 进度（状态、窗口、缺段、错误）
 - `GET /api/jobs/{id}/download` 下载 ZIP（未完成返回 409）
+
+进度字段：`expected`（应收）、`saved`（已存）、`missing`（逐号缺段，小跨度）、
+`missing_ranges`（大跨度缺段闭区间列表，如 `[[105, 400104]]`）、
+`missing_count`（缺段总数，含区间内数量）。
 
 任务状态：`recording` →（停止）→ `finalizing` → `done` / `failed`。
 
@@ -69,8 +80,10 @@ docker-compose.yml
 本仓库代码已在本地以与容器相同的命令（`uvicorn src.main:app`）完成端到端
 自测：基本录制-停止-打包、ZIP 内容校验（本地清单/连续序号/无远端引用/
 片段字节一致/ffmpeg 可解码）、两路并发与慢源不阻塞、缺段 404 失败、窗口
-跳号失败、非法清单拒绝、ENDLIST 自动定界、崩溃（`os._exit`）后重启续录、
-停止边界重启不变、落盘与登记之间崩溃的收养恢复，共 29 项全部通过。
+跳号失败、大跨度跳号（40 万序号）及时判失败并只记闭区间（不逐号占库、
+不返回巨型列表、计数准确、并发录制与查询不受影响、重启后缺段保留且禁止
+下载）、非法清单拒绝、ENDLIST 自动定界、崩溃（`os._exit`）后重启续录、
+停止边界重启不变、落盘与登记之间崩溃的收养恢复，共 41 项全部通过。
 
 测试钩子（仅 `RECORDER_TEST_HOOKS=1` 时挂载，compose 不启用）：
 `POST /api/_test/crash` 立即崩溃；`POST /api/_test/arm_after_write/{job}/{seq}`

@@ -47,7 +47,12 @@ def job_json(job_id: int) -> dict:
         "stop_seq": job["stop_seq"],
         "expected": counts["total"],
         "saved": counts["done"],
+        # Per-sequence missing numbers (small spans, original interface)...
         "missing": db.missing_seqs(job_id),
+        # ...plus closed intervals for large spans, so a huge gap is never
+        # returned as a giant list. missing_count always gives the total.
+        "missing_ranges": db.missing_ranges(job_id),
+        "missing_count": counts["missing"],
         "error": job["error"],
         "download_url": f"/api/jobs/{job_id}/download" if job["state"] == "done" else None,
     }

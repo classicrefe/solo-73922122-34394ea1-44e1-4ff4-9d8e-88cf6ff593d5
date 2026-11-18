@@ -34,7 +34,20 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_job_url
   ON segments(job_id, url) WHERE url IS NOT NULL;
+CREATE TABLE IF NOT EXISTS missing_ranges (
+  job_id INTEGER NOT NULL,
+  start_seq INTEGER NOT NULL,   -- closed interval [start_seq, end_seq], both ends missing
+  end_seq INTEGER NOT NULL,
+  PRIMARY KEY (job_id, start_seq)
+);
 """
+
+# A skipped span up to this many sequence numbers is still stored as one row
+# per number (the original per-sequence interface lists them individually).
+# Longer spans are stored as a single closed-interval row in missing_ranges,
+# so a huge jump (e.g. a source reconnect skipping hundreds of thousands of
+# numbers) never floods the DB row-by-row nor stalls the other jobs.
+MISSING_ROW_MAX = 1000
 
 
 class DB:
@@ -124,13 +137,36 @@ class DB:
                 (job_id, seq, url, duration, title),
             )
 
-    def insert_missing(self, job_id: int, seqs):
+    def record_missing_span(self, job_id: int, start_seq: int, end_seq: int):
+        """Persist the closed interval [start_seq, end_seq] the window skipped.
+
+        Small spans keep per-sequence rows so the original interface can list
+        every missing number; large spans become one interval row — O(1)
+        writes regardless of span length, so the DB lock is held only briefly
+        and other recordings/stops/queries keep responding.
+        """
+        count = end_seq - start_seq + 1
         with self._lock, self._conn:
-            for s in seqs:
+            if count <= MISSING_ROW_MAX:
+                for s in range(start_seq, end_seq + 1):
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO segments(job_id, seq, url, status, error) VALUES (?,?,NULL,'missing','窗口越过，未发现该序号')",
+                        (job_id, s),
+                    )
+            else:
                 self._conn.execute(
-                    "INSERT OR IGNORE INTO segments(job_id, seq, url, status, error) VALUES (?,?,NULL,'missing','窗口越过，未发现该序号')",
-                    (job_id, s),
+                    "INSERT OR IGNORE INTO missing_ranges(job_id, start_seq, end_seq) VALUES (?,?,?)",
+                    (job_id, start_seq, end_seq),
                 )
+            self._touch(job_id)
+
+    def missing_ranges(self, job_id: int):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT start_seq, end_seq FROM missing_ranges WHERE job_id=? ORDER BY start_seq",
+                (job_id,),
+            ).fetchall()
+            return [[r["start_seq"], r["end_seq"]] for r in rows]
 
     def get_segment(self, job_id: int, seq: int):
         with self._lock:
@@ -192,10 +228,18 @@ class DB:
                 "FROM segments WHERE job_id=?",
                 (job_id,),
             ).fetchone()
+            # Large skipped spans live in missing_ranges, not in segments;
+            # their length still counts towards expected/missing so the
+            # progress numbers stay accurate.
+            skipped = self._conn.execute(
+                "SELECT COALESCE(SUM(end_seq - start_seq + 1), 0) AS n "
+                "FROM missing_ranges WHERE job_id=?",
+                (job_id,),
+            ).fetchone()["n"] or 0
             return {
-                "total": row["total"] or 0,
+                "total": (row["total"] or 0) + skipped,
                 "done": row["done"] or 0,
-                "missing": row["missing"] or 0,
+                "missing": (row["missing"] or 0) + skipped,
             }
 
     def missing_seqs(self, job_id: int):
